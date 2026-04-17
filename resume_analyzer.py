@@ -1,7 +1,12 @@
-import argparse
 import os
 import re
+import json
 
+# Load .env
+from dotenv import load_dotenv
+load_dotenv()
+
+# Optional imports
 try:
     import PyPDF2
 except ImportError:
@@ -12,25 +17,23 @@ try:
 except ImportError:
     docx = None
 
-AI_MARKERS = [
-    "delve", "testament", "orchestrated", "spearheaded", "tapestry", 
-    "seamlessly", "unwavering", "meticulous", "synergy", "pivotal", 
-    "navigate", "fostered", "realm", "profound", "multifaceted", "dynamic"
+
+SECTION_HEADERS = [
+    "experience", "work history", "employment",
+    "education", "skills", "projects",
+    "certifications", "summary", "objective"
 ]
 
-SCAM_MARKERS = [
-    "western union", "wire transfer", "processing fee", "upfront payment", 
-    "money order", "kindly", "guaranteed income", "crypto", "bitcoin",
-    "confidential company", "undisclosed client", "account detail"
-]
 
+# ---------------- TEXT EXTRACTION ---------------- #
 def extract_text(file_path):
     ext = os.path.splitext(file_path)[1].lower()
     text = ""
+
     if ext == '.pdf':
         if PyPDF2 is None:
-            print("Error: PyPDF2 is not installed. Run 'pip install PyPDF2' to read PDFs.")
-            return ""
+            return "ERROR: PyPDF2 not installed"
+
         try:
             with open(file_path, 'rb') as f:
                 reader = PyPDF2.PdfReader(f)
@@ -39,105 +42,126 @@ def extract_text(file_path):
                     if extracted:
                         text += extracted + " "
         except Exception as e:
-            print(f"Error reading PDF: {e}")
-    elif ext in ['.doc', '.docx']:
+            return f"ERROR reading PDF: {e}"
+
+    elif ext in ['.docx', '.doc']:
         if docx is None:
-            print("Error: python-docx is not installed. Run 'pip install python-docx' to read DOCX files.")
-            return ""
+            return "ERROR: python-docx not installed"
+
         try:
             doc = docx.Document(file_path)
             for para in doc.paragraphs:
                 text += para.text + " "
         except Exception as e:
-            print(f"Error reading DOCX: {e}")
+            return f"ERROR reading DOCX: {e}"
+
     elif ext == '.txt':
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 text = f.read()
         except Exception as e:
-            print(f"Error reading TXT: {e}")
+            return f"ERROR reading TXT: {e}"
+
     else:
-        print(f"Unsupported file format: {ext}")
+        return "ERROR: Unsupported file format"
+
     return text
 
-def analyze_text(text):
-    text_lower = text.lower()
-    
-    ai_matches = {}
-    for marker in AI_MARKERS:
-        # Match whole words only
-        count = len(re.findall(r'\b' + re.escape(marker) + r'\b', text_lower))
-        if count > 0:
-            ai_matches[marker] = count
-            
-    scam_matches = {}
-    for marker in SCAM_MARKERS:
-        count = len(re.findall(r'\b' + re.escape(marker) + r'\b', text_lower))
-        if count > 0:
-            scam_matches[marker] = count
-            
-    return ai_matches, scam_matches
 
-def generate_report(ai_matches, scam_matches, total_words):
-    print("=" * 50)
-    print("RESUME ANALYSIS REPORT")
-    print("=" * 50)
-    
-    print(f"\nTotal Words Analyzed: {total_words}")
-    
-    print("\n--- AI Generation Markers ---")
-    ai_total = sum(ai_matches.values())
-    if ai_total == 0:
-        print("No obvious AI markers found. (Low Risk)")
-    else:
-        print(f"Found {ai_total} instances of common AI buzzwords.")
-        for word, count in ai_matches.items():
-            print(f"  - '{word}': {count} time(s)")
-            
-        if ai_total > 5:
-            print("Risk Level: HIGH (Likely AI-assisted or generated)")
-        elif ai_total > 2:
-            print("Risk Level: MEDIUM (Possible AI assistance)")
-        else:
-            print("Risk Level: LOW (Minimal AI markers)")
+# ---------------- BASIC CHECKS ---------------- #
+def check_essential_info(text):
+    email = bool(re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', text))
+    phone = bool(re.search(r'\+?\d[\d \-\(\)\.]{8,15}\d', text))
+    links = bool(re.search(r'https?://[^\s]+|www\.[^\s]+', text))
+    return email, phone, links
 
-    print("\n--- Scam/Fraud Indicators ---")
-    scam_total = sum(scam_matches.values())
-    if scam_total == 0:
-        print("No obvious scam indicators found. (Low Risk)")
-    else:
-        print(f"Found {scam_total} suspicious phrases.")
-        for word, count in scam_matches.items():
-            print(f"  - '{word}': {count} time(s)")
-            
-        if scam_total > 2:
-            print("Risk Level: HIGH (Strong indications of a scam)")
-        else:
-            print("Risk Level: MEDIUM (Suspicious language present)")
-            
-    print("=" * 50)
 
-def main():
-    parser = argparse.ArgumentParser(description="Analyze a resume for AI generation and scam markers.")
-    parser.add_argument("file_path", help="Path to the resume file (.pdf, .docx, .txt)")
-    args = parser.parse_args()
-    
-    if not os.path.exists(args.file_path):
-        print(f"File not found: {args.file_path}")
-        return
-        
-    print(f"Analyzing {args.file_path}...")
-    text = extract_text(args.file_path)
-    
-    if not text.strip():
-        print("Could not extract any text from the file.")
-        return
-        
-    words = text.split()
-    total_words = len(words)
-    
-    ai_matches, scam_matches = analyze_text(text)
-    generate_report(ai_matches, scam_matches, total_words)
+def check_structure(text):
+    found = []
+    for header in SECTION_HEADERS:
+        if re.search(r'\b' + header + r'\b', text):
+            found.append(header)
+    return found
 
-if __name__ == "__main__":
-    main()
+
+# ---------------- LLM ANALYSIS ---------------- #
+from google import genai
+
+def analyze_with_llm(text):
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        return {"error": "GEMINI_API_KEY not found in .env"}
+
+    try:
+        client = genai.Client(api_key=api_key)
+
+        prompt = f"""
+You are an expert technical recruiter and fraud analyst.
+
+Analyze the resume and return ONLY JSON:
+
+{{
+    "ai_generated_percentage": 0-100,
+    "ai_risk_level": "LOW/MEDIUM/HIGH",
+    "ai_reasoning": "short reason",
+    "scam_risk_level": "LOW/MEDIUM/HIGH",
+    "scam_indicators": [],
+    "scam_reasoning": "short reason"
+}}
+
+Resume:
+\"\"\"
+{text[:3000]}
+\"\"\"
+"""
+
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt
+        )
+
+        result = response.text.strip()
+
+        if result.startswith(""):
+            result = result.replace("json", "").replace("```", "").strip()
+
+        return json.loads(result)
+
+    except Exception as e:
+        return {"error": str(e)}
+
+# ---------------- MAIN PIPELINE ---------------- #
+def run_pipeline(file_path):
+    if not os.path.exists(file_path):
+        return {"error": "File not found"}
+
+    text = extract_text(file_path)
+
+    if not text or text.startswith("ERROR"):
+        return {"error": text}
+
+    total_words = len(text.split())
+
+    email, phone, links = check_essential_info(text)
+    sections = check_structure(text.lower())
+
+    llm_result = analyze_with_llm(text)
+
+    return {
+        "total_words": total_words,
+        "contact_info": {
+            "email": email,
+            "phone": phone,
+            "links": links
+        },
+        "sections_found": sections,
+        "llm_analysis": llm_result
+    }
+
+
+# ---------------- DIRECT TEST ---------------- #
+if _name_ == "_main_":
+    file_path = r"D:\job-align\ml\data\raw\ai_resume_test.pdf"
+
+    result = run_pipeline(file_path)
+    print(json.dumps(result, indent=2))
